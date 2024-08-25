@@ -1,2 +1,1 @@
-# rebml
-Rust EBML
+A library to support writing and reading EBML files, that is agnostic to the schema of the file.

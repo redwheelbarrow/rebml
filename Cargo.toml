@@ -1,0 +1,11 @@
+[package]
+name = "rebml"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.6.1"
+compact_str = "0.8.0"
+memmap2 = "0.9.4"
+thiserror = "1.0.63"
+tinyvec = {version="1.8.0", features=["alloc"]}
