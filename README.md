@@ -6,6 +6,7 @@ A library to support writing and reading EBML files in dynamic environments.
 1. Leave file/IO management to the client code
 1. Minimal memory footprint
 1. Leave schema adherence to higher level libraries
+1. Enable low level control of bytes
 
 # Read Example
 ```
