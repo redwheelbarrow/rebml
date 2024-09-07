@@ -1,38 +1,162 @@
-
-
-use std::io::{Cursor, Seek};
-
-use bytes::Buf;
+use crate::{get_data, get_data_size, get_element_id, EbmlError};
 use compact_str::CompactString;
+use std::io::{Cursor, Read, Seek};
 
-use crate::{get_data_size, get_element_id, EbmlError, VarInt};
+pub struct EbmlElement {
+    pub id: u64,
+    pub size: VarInt,
+    pub length: u64,
+}
 
-pub struct DataWrapper<'a>(&'a [u8]);
+impl TryFrom<&mut Cursor<&[u8]>> for EbmlElement {
+    type Error = EbmlError;
 
-impl<'a> std::fmt::Debug for DataWrapper<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("DataWrapper")
-            //.field(&self.0)
-            .finish()
+    fn try_from(cursor: &mut Cursor<&[u8]>) -> Result<Self, Self::Error> {
+        let start = cursor.position();
+        let id = match get_element_id(cursor) {
+            Ok(v) => v,
+            Err(_) => return Err(EbmlError::ElementIdAllOnes),
+        };
+        let size = match get_data_size(cursor) {
+            Ok(v) => v,
+            Err(_) => return Err(EbmlError::ElementIdAllOnes),
+        };
+        let end = cursor.position();
+        Ok(EbmlElement {
+            id,
+            size,
+            length: end - start,
+        })
     }
 }
 
-#[derive(Debug)]
-pub struct EbmlString<'a> {
-    value: CompactString,
-    /// This includes the full range of the string, even if there is a null terminator somewhere
-    data: DataWrapper<'a>,
-    /// The position of the end of the string (null terminator or end)
-    end: usize,
+impl EbmlElement {
+  #[inline]
+  pub fn get_data<'a>(&self, cursor: &mut Cursor<&'a [u8]>) -> Result<&'a [u8], EbmlError> {
+    get_data(self.size.value, cursor)
+  }
+
+  pub fn get_child<'a>(&self, cursor: &mut Cursor<&'a [u8]>) -> Result<EbmlElement, EbmlError> {
+    EbmlElement::try_from(&mut *cursor)
+  }
 }
 
-impl<'a> EbmlString<'a> {
+#[derive(Debug, Clone, Default)]
+pub struct EbmlHeader {
+    version: Option<EbmlUnsignedInteger>,
+    read_version: Option<EbmlUnsignedInteger>,
+    max_id_length: Option<EbmlUnsignedInteger>,
+    max_size_length: Option<EbmlUnsignedInteger>,
+    doc_type: Option<EbmlString>,
+    doc_type_version: Option<EbmlUnsignedInteger>,
+    doc_type_read_version: Option<EbmlUnsignedInteger>,
+    doc_type_extensions: Option<Vec<DocTypeExtension>>,
+}
+
+impl TryFrom<&mut Cursor<&[u8]>> for EbmlHeader {
+    type Error = EbmlError;
+
+    fn try_from(cursor: &mut Cursor<&[u8]>) -> Result<Self, Self::Error> {
+        let mut header = EbmlHeader::default();
+
+        let ebml = EbmlElement::try_from(&mut *cursor)?;
+        if ebml.id != Ebml::ID {
+            return Err(EbmlError::InvalidElement(format!(
+                "Invalid element id: {:X}",
+                ebml.id
+            )));
+        }
+
+        while cursor.position() < ebml.size.value + ebml.length {
+            let element = EbmlElement::try_from(&mut *cursor)?;
+            match element.id {
+                EbmlVersion::ID => {
+                    let data = get_data(element.size.value, &mut *cursor)?;
+                    header.version = Some(EbmlUnsignedInteger::new(data)?);
+                }
+                DocType::ID => {
+                    let data = get_data(element.size.value, &mut *cursor)?;
+                    header.doc_type = Some(EbmlString::new(data)?);
+                }
+                DocTypeVersion::ID => {
+                    let data = get_data(element.size.value, &mut *cursor)?;
+                    header.doc_type_version = Some(EbmlUnsignedInteger::new(data)?);
+                }
+                DocTypeReadVersion::ID => {
+                    let data = get_data(element.size.value, &mut *cursor)?;
+                    header.doc_type_read_version = Some(EbmlUnsignedInteger::new(data)?);
+                }
+                EbmlReadVersion::ID => {
+                    let data = get_data(element.size.value, &mut *cursor)?;
+                    header.read_version = Some(EbmlUnsignedInteger::new(data)?);
+                }
+                EbmlMaxIdLength::ID => {
+                    let data = get_data(element.size.value, &mut *cursor)?;
+                    header.max_id_length = Some(EbmlUnsignedInteger::new(data)?);
+                }
+                EbmlMaxSizeLength::ID => {
+                    let data = get_data(element.size.value, &mut *cursor)?;
+                    header.max_size_length = Some(EbmlUnsignedInteger::new(data)?);
+                }
+                DocTypeExtension::ID => {
+                    let first_element = EbmlElement::try_from(&mut *cursor)?;
+                    let first_data = get_data(first_element.size.value, &mut *cursor)?;
+                    let second_element = EbmlElement::try_from(&mut *cursor)?;
+                    let second_data = get_data(second_element.size.value, &mut *cursor)?;
+
+                    let extension;
+                    if first_element.id == DocTypeExtensionName::ID
+                        && second_element.id == DocTypeExtensionVersion::ID
+                    {
+                        let name = EbmlString::new(first_data)?;
+                        let version = EbmlUnsignedInteger::new(second_data)?;
+                        extension = DocTypeExtension::new(name, version);
+                    } else if first_element.id == DocTypeExtensionVersion::ID
+                        && second_element.id == DocTypeExtensionName::ID
+                    {
+                        let name = EbmlString::new(second_data)?;
+                        let version = EbmlUnsignedInteger::new(first_data)?;
+                        extension = DocTypeExtension::new(name, version);
+                    } else {
+                        return Err(EbmlError::InvalidElement(format!(
+                            "Unrecognized one or two element ids in ebml header: {:X}, {:X}",
+                            first_element.id, second_element.id
+                        )));
+                    }
+
+                    match header.doc_type_extensions {
+                        Some(ref mut v) => v.push(extension),
+                        None => {
+                            header.doc_type_extensions = Some(vec![extension]);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(EbmlError::InvalidElement(format!(
+                        "EBML Header contains invalid element ID {:X}",
+                        element.id
+                    )))
+                }
+            }
+        }
+
+        Ok(header)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EbmlString {
+    value: CompactString,
+    /// The position of the end of the string (null terminator or end)
+    end: usize,
+    /// The entire length of the string
+    full_end: usize,
+}
+
+impl EbmlString {
     /// Creates the string starting from the current position of the cursor up to the size
-    pub fn new(size: &VarInt, cursor: &mut Cursor<&'a [u8]>) -> Result<Self, EbmlError> {
+    pub fn new(data: &[u8]) -> Result<Self, EbmlError> {
         let result = {
-            let absolute_start = cursor.position() as usize;
-            let absolute_end = size.value as usize + absolute_start;
-            let data = &cursor.get_ref()[absolute_start..absolute_end];
             let mut end = data.len();
             for (ind, b) in data.iter().enumerate() {
                 if (*b < 0x20 || *b > 0x7E) && *b != 0 {
@@ -46,263 +170,191 @@ impl<'a> EbmlString<'a> {
             Ok(Self {
                 value: CompactString::from_utf8(&data[..end])
                     .map_err(|_e| EbmlError::InvalidString)?,
-                data: DataWrapper(data),
+                full_end: data.len(),
                 end,
             })
         };
-        let _ = cursor.advance(size.value as usize);
         result
     }
-
-    pub fn get_str(&'a self) -> &'a CompactString {
-        &self.value
-    }
 }
 
-#[derive(Debug)]
-pub struct EbmlUnsignedInteger<'a> {
+#[derive(Debug, Clone)]
+pub struct EbmlUnsignedInteger {
     value: u64,
-    data: DataWrapper<'a>,
 }
 
-impl<'a> EbmlUnsignedInteger<'a> {
-    pub fn new(size: &VarInt, cursor: &mut Cursor<&'a [u8]>) -> Result<Self, EbmlError> {
-        let absolute_start = cursor.position() as usize;
-        let absolute_end = size.value as usize + absolute_start;
-        let data = &cursor.get_ref()[absolute_start..absolute_end];
-        cursor.advance(data.len());
+impl EbmlUnsignedInteger {
+    pub fn new(data: &[u8]) -> Result<Self, EbmlError> {
+        if data.len() > 8 {
+            return Err(EbmlError::OverMaximumSize(8));
+        }
         let mut bytes: [u8; 8] = [0u8; 8];
         for (i, b) in data.iter().rev().enumerate() {
             bytes[i] = *b;
         }
 
-        bytes.reverse(); // could just rotate??
+        bytes.reverse();
 
-        let value = u64::from_be_bytes(bytes);
         Ok(Self {
-            value,
-            data: DataWrapper(data),
+            value: u64::from_be_bytes(bytes),
         })
     }
 }
 
-pub enum EbmlElementId {
-    // Crc32,
-    // Void,
-    Ebml,
-    EbmlVersion,
-    EbmlReadVersion,
-    EbmlMaxIdLength,
-    EbmlMaxSizeLength,
-    DocType,
-    DocTypeVersion,
-    DocTypeReadVersion,
-    DocTypeExtension,
-    DocTypeExtensionName,
-    DocTypeExtensionVersion,
-    Crc32,
-    Void,
-    Unknown(u64),
-}
-
-impl From<u64> for EbmlElementId {
-    fn from(value: u64) -> Self {
-        match value {
-            Ebml::ID => EbmlElementId::Ebml,
-            EbmlVersion::ID => EbmlElementId::EbmlVersion,
-            EbmlReadVersion::ID => EbmlElementId::EbmlReadVersion,
-            EbmlMaxIdLength::ID => EbmlElementId::EbmlMaxIdLength,
-            EbmlMaxSizeLength::ID => EbmlElementId::EbmlMaxSizeLength,
-            DocType::ID => EbmlElementId::DocType,
-            DocTypeVersion::ID => EbmlElementId::DocTypeVersion,
-            DocTypeReadVersion::ID => EbmlElementId::DocTypeReadVersion,
-            DocTypeExtension::ID => EbmlElementId::DocTypeExtension,
-            DocTypeExtensionName::ID => EbmlElementId::DocTypeExtensionName,
-            DocTypeExtensionVersion::ID => EbmlElementId::DocTypeExtensionVersion,
-            Crc32::ID => EbmlElementId::Crc32,
-            Void::ID => EbmlElementId::Void,
-            _ => EbmlElementId::Unknown(value),
-        }
-    }
-}
-
-impl From<EbmlElementId> for u64 {
-    fn from(value: EbmlElementId) -> Self {
-        match value {
-            EbmlElementId::Ebml => Ebml::ID,
-            EbmlElementId::EbmlVersion => EbmlVersion::ID,
-            EbmlElementId::EbmlReadVersion => EbmlReadVersion::ID,
-            EbmlElementId::EbmlMaxIdLength => EbmlMaxIdLength::ID,
-            EbmlElementId::EbmlMaxSizeLength => EbmlMaxSizeLength::ID,
-            EbmlElementId::DocType => DocType::ID,
-            EbmlElementId::DocTypeVersion => DocTypeVersion::ID,
-            EbmlElementId::DocTypeReadVersion => DocTypeReadVersion::ID,
-            EbmlElementId::Unknown(v) => v,
-            EbmlElementId::DocTypeExtension => DocTypeExtension::ID,
-            EbmlElementId::DocTypeExtensionName => DocTypeExtensionName::ID,
-            EbmlElementId::DocTypeExtensionVersion => DocTypeExtensionVersion::ID,
-            EbmlElementId::Crc32 => Crc32::ID,
-            EbmlElementId::Void => Void::ID,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct DocType<'a> {
+#[derive(Debug, Clone)]
+pub struct DocType {
     size: VarInt,
-    value: EbmlString<'a>,
+    value: EbmlString,
 }
 
-impl<'a> DocType<'a> {
+impl DocType {
     // range: >0
-    const ID: u64 = 0x4282;
+    pub const ID: u64 = 0x4282;
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlString<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlString) -> Self {
         DocType { size, value }
     }
 }
 
-#[derive(Debug)]
-pub struct DocTypeVersion<'a> {
+#[derive(Debug, Clone)]
+pub struct DocTypeVersion {
     size: VarInt,
-    value: EbmlUnsignedInteger<'a>,
+    value: EbmlUnsignedInteger,
 }
 
-impl<'a> DocTypeVersion<'a> {
-    const ID: u64 = 0x4287;
+impl DocTypeVersion {
+    pub const ID: u64 = 0x4287;
     const DEFAULT: u64 = 1; // range: >0
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlUnsignedInteger<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlUnsignedInteger) -> Self {
         DocTypeVersion { size, value }
     }
 }
 
-#[derive(Debug)]
-pub struct DocTypeReadVersion<'a> {
+#[derive(Debug, Clone)]
+pub struct DocTypeReadVersion {
     size: VarInt,
-    value: EbmlUnsignedInteger<'a>,
+    value: EbmlUnsignedInteger,
 }
 
-impl<'a> DocTypeReadVersion<'a> {
-    const ID: u64 = 0x4285;
+impl DocTypeReadVersion {
+    pub const ID: u64 = 0x4285;
     const DEFAULT: u64 = 1; // range: >0
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlUnsignedInteger<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlUnsignedInteger) -> Self {
         DocTypeReadVersion { size, value }
     }
 }
 
-trait MasterElement {}
-impl MasterElement for DocTypeExtension {}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DocTypeExtension {
-    size: VarInt,
-    index: usize,
+    name: EbmlString,
+    version: EbmlUnsignedInteger,
 }
 
-impl<'a> DocTypeExtension {
-    const ID: u64 = 0x4281;
+impl DocTypeExtension {
+    pub const ID: u64 = 0x4281;
     const MIN_OCCURS: u8 = 0;
-    pub fn new(size: VarInt, index: usize) -> Self {
-        DocTypeExtension { size, index }
+
+    pub fn new(name: EbmlString, version: EbmlUnsignedInteger) -> Self {
+        Self { name, version }
     }
 }
 
-#[derive(Debug)]
-pub struct DocTypeExtensionName<'a> {
+#[derive(Debug, Clone)]
+pub struct DocTypeExtensionName {
     size: VarInt,
-    value: EbmlString<'a>,
+    value: EbmlString,
 }
 
-impl<'a> DocTypeExtensionName<'a> {
-    const ID: u64 = 0x4283;
+impl DocTypeExtensionName {
+    pub const ID: u64 = 0x4283;
     //const LENGTH: greater than 1
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlString<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlString) -> Self {
         DocTypeExtensionName { size, value }
     }
 }
 
-#[derive(Debug)]
-pub struct DocTypeExtensionVersion<'a> {
+#[derive(Debug, Clone)]
+pub struct DocTypeExtensionVersion {
     size: VarInt,
-    value: EbmlUnsignedInteger<'a>,
+    value: EbmlUnsignedInteger,
 }
 
-impl<'a> DocTypeExtensionVersion<'a> {
-    const ID: u64 = 0x4284; // range not 0
+impl DocTypeExtensionVersion {
+    pub const ID: u64 = 0x4284; // range not 0
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlUnsignedInteger<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlUnsignedInteger) -> Self {
         DocTypeExtensionVersion { size, value }
     }
 }
 
-#[derive(Debug)]
-pub struct EbmlVersion<'a> {
+#[derive(Debug, Clone)]
+pub struct EbmlVersion {
     size: VarInt,
-    value: EbmlUnsignedInteger<'a>,
+    value: EbmlUnsignedInteger,
 }
 
-impl<'a> EbmlVersion<'a> {
-    const ID: u64 = 0x4286;
+impl EbmlVersion {
+    pub const ID: u64 = 0x4286;
     const DEFAULT: u64 = 1; // range: >0
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlUnsignedInteger<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlUnsignedInteger) -> Self {
         EbmlVersion { size, value }
     }
 }
 
-#[derive(Debug)]
-pub struct EbmlReadVersion<'a> {
+#[derive(Debug, Clone)]
+pub struct EbmlReadVersion {
     size: VarInt,
-    value: EbmlUnsignedInteger<'a>,
+    value: EbmlUnsignedInteger,
 }
 
-impl<'a> EbmlReadVersion<'a> {
-    const ID: u64 = 0x42F7;
+impl EbmlReadVersion {
+    pub const ID: u64 = 0x42F7;
     const DEFAULT: u8 = 1; // Range: ==1
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlUnsignedInteger<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlUnsignedInteger) -> Self {
         EbmlReadVersion { size, value }
     }
 }
 
-#[derive(Debug)]
-pub struct EbmlMaxIdLength<'a> {
+#[derive(Debug, Clone)]
+pub struct EbmlMaxIdLength {
     size: VarInt,
-    value: EbmlUnsignedInteger<'a>,
+    value: EbmlUnsignedInteger,
 }
 
-impl<'a> EbmlMaxIdLength<'a> {
-    const ID: u64 = 0x42F2;
+impl EbmlMaxIdLength {
+    pub const ID: u64 = 0x42F2;
     const DEFAULT: u8 = 4; // range: >=4
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlUnsignedInteger<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlUnsignedInteger) -> Self {
         EbmlMaxIdLength { size, value }
     }
 }
 
-#[derive(Debug)]
-pub struct EbmlMaxSizeLength<'a> {
+#[derive(Debug, Clone)]
+pub struct EbmlMaxSizeLength {
     size: VarInt,
-    value: EbmlUnsignedInteger<'a>,
+    value: EbmlUnsignedInteger,
 }
 
-impl<'a> EbmlMaxSizeLength<'a> {
-    const ID: u64 = 0x42F3;
+impl EbmlMaxSizeLength {
+    pub const ID: u64 = 0x42F3;
     const DEFAULT: u8 = 8; // range: >0
     const MIN_OCCURS: u8 = 1;
     const MAX_OCCURS: u8 = 1;
-    pub fn new(size: VarInt, value: EbmlUnsignedInteger<'a>) -> Self {
+    pub fn new(size: VarInt, value: EbmlUnsignedInteger) -> Self {
         EbmlMaxSizeLength { size, value }
     }
 }
@@ -312,14 +364,14 @@ pub struct Ebml {
 }
 
 impl Ebml {
-    const ID: u64 = 0x1A45DFA3;
+    pub const ID: u64 = 0x1A45DFA3;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EbmlBinary<'a> {
-    data: DataWrapper<'a>,
     index: u64,
     size: u64,
+    data: &'a [u8],
 }
 
 impl<'a> EbmlBinary<'a> {
@@ -333,12 +385,12 @@ impl<'a> EbmlBinary<'a> {
         Ok(Self {
             size: size.value,
             index,
-            data: DataWrapper(data),
+            data,
         })
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Crc32<'a> {
     size: VarInt,
     binary: EbmlBinary<'a>,
@@ -355,7 +407,7 @@ impl<'a> Crc32<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Void {
     size: VarInt,
 }
@@ -368,202 +420,132 @@ impl Void {
     }
 }
 
-pub enum EbmlGlobalElement<'a> {
-    Crc32(Crc32<'a>),
-    Void(Void),
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Clone)]
+pub enum VarIntLength {
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight,
 }
 
-pub enum Element<'a> {
-    Global(EbmlGlobalElement<'a>),
-    Header(EbmlHeaderElement<'a>),
-    Unknown(u64),
-}
-
-pub enum EbmlHeaderElement<'a> {
-    Ebml(Ebml),
-    EbmlVersion(EbmlVersion<'a>),
-    EbmlReadVersion(EbmlReadVersion<'a>),
-    EbmlMaxIdLength(EbmlMaxIdLength<'a>),
-    EbmlMaxSizeLength(EbmlMaxSizeLength<'a>),
-    DocType(DocType<'a>),
-    DocTypeVersion(DocTypeVersion<'a>),
-    DocTypeReadVersion(DocTypeReadVersion<'a>),
-    DocTypeExtension(DocTypeExtension),
-    DocTypeExtensionName(DocTypeExtensionName<'a>),
-    DocTypeExtensionVersion(DocTypeExtensionVersion<'a>),
-}
-
-////////////////////////// parser
-pub trait EbmlParser<'a> {
-    type Output;
-    fn next(
-        &self,
-        id: u64,
-        size: VarInt,
-        cursor: &mut Cursor<&'a [u8]>,
-    ) -> Result<Self::Output, EbmlError>;
-}
-
-pub struct EbmlIterator<'a, T: EbmlParser<'a>> {
-    parser: T,
-    cursor: &'a mut Cursor<&'a [u8]>,
-}
-
-impl<'a, T: EbmlParser<'a>> EbmlIterator<'a, T> {
-    pub fn new(parser: T, cursor: &'a mut Cursor<&'a [u8]>) -> Self {
-        EbmlIterator { parser, cursor }
+impl VarIntLength {
+    fn new(num_bytes: usize) -> Result<Self, EbmlError> {
+        match num_bytes {
+            1 => Ok(VarIntLength::One),
+            2 => Ok(VarIntLength::Two),
+            3 => Ok(VarIntLength::Three),
+            4 => Ok(VarIntLength::Four),
+            5 => Ok(VarIntLength::Five),
+            6 => Ok(VarIntLength::Six),
+            7 => Ok(VarIntLength::Seven),
+            8 => Ok(VarIntLength::Eight),
+            _ => Err(EbmlError::InvalidVarIntLength),
+        }
     }
-}
 
-impl<'a, T: EbmlParser<'a>> Iterator for EbmlIterator<'a, T> {
-    type Item = Result<T::Output, EbmlError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.cursor.has_remaining() {
-            let id = match get_element_id(self.cursor) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
-            };
-            let size = match get_data_size(self.cursor) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
-            };
-
-            Some(self.parser.next(id, size, self.cursor))
-        } else {
-            None
+    fn maximum_value(&self) -> u64 {
+        match self {
+            VarIntLength::One => 127,
+            VarIntLength::Two => 16383,
+            VarIntLength::Three => 2097151,
+            VarIntLength::Four => 268435455,
+            VarIntLength::Five => 34359738367,
+            VarIntLength::Six => 4398046511103,
+            VarIntLength::Seven => 562949953421311,
+            VarIntLength::Eight => 72057594037927935,
         }
     }
 }
 
-pub struct BaseEbmlParser {}
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct VarInt {
+    pub length: VarIntLength,
+    bytes: [u8; 8],
+    pub value: u64,
+    pub raw_value: u64, // The value before masking the marker bit
+}
 
-impl BaseEbmlParser {
-    pub fn new() -> Self {
-        BaseEbmlParser {}
+impl VarInt {
+    #[inline]
+    pub fn get_var_int(cursor: &mut Cursor<&[u8]>) -> Result<VarInt, EbmlError> {
+        let (num_bytes, masked_first_byte, first_byte) = Self::get_var_int_length(cursor)?;
+        if num_bytes > 8 || num_bytes == 0 {
+            Err(EbmlError::InvalidVarIntLength)
+        } else {
+            let varint = Self::get_var_int_value(cursor, masked_first_byte, num_bytes)?;
+            let mut raw_value = varint.clone();
+            raw_value[8 - num_bytes] = first_byte;
+            Ok(VarInt {
+                length: VarIntLength::new(num_bytes)?,
+                bytes: varint,
+                raw_value: u64::from_be_bytes(raw_value),
+                value: u64::from_be_bytes(varint),
+            })
+        }
     }
-}
 
-impl<'a> EbmlParser<'a> for BaseEbmlParser {
-    type Output = Element<'a>;
-    fn next(
-        &self,
-        id: u64,
-        size: VarInt,
-        cursor: &mut Cursor<&'a [u8]>,
-    ) -> Result<Self::Output, EbmlError> {
-        // TODO: during WRITING, the size might not be known, and if unknownsizeallowed is true, this is allowed. But once it is saved, it must be set
-        let header_element = match EbmlElementId::from(id) {
-            EbmlElementId::Ebml => Element::Header(EbmlHeaderElement::Ebml(Ebml { size })),
-            EbmlElementId::EbmlVersion => {
-                let value = EbmlUnsignedInteger::new(&size, cursor)?;
-                let version = EbmlVersion::new(size, value);
-                Element::Header(EbmlHeaderElement::EbmlVersion(version))
+    /// Get the size of the varint and the value of the first byte with the market bit removed
+    #[inline]
+    fn get_var_int_length(cursor: &mut Cursor<&[u8]>) -> Result<(usize, u8, u8), EbmlError> {
+        let mut bytes: [u8; 1] = [0; 1];
+
+        if cursor.read(&mut bytes[..])? == 1 {
+            let zeros = bytes[0].leading_zeros() as usize;
+            if zeros == 8 {
+                return Err(EbmlError::VarIntNoLength);
             }
-            EbmlElementId::EbmlReadVersion => {
-                let value = EbmlUnsignedInteger::new(&size, cursor)?;
-                let version = EbmlReadVersion::new(size, value);
-                Element::Header(EbmlHeaderElement::EbmlReadVersion(version))
-            }
-            EbmlElementId::EbmlMaxIdLength => {
-                let value = EbmlUnsignedInteger::new(&size, cursor)?;
-                Element::Header(EbmlHeaderElement::EbmlMaxIdLength(EbmlMaxIdLength::new(
-                    size, value,
-                )))
-            }
-            EbmlElementId::EbmlMaxSizeLength => {
-                let value = EbmlUnsignedInteger::new(&size, cursor)?;
-                Element::Header(EbmlHeaderElement::EbmlMaxSizeLength(
-                    EbmlMaxSizeLength::new(size, value),
-                ))
-            }
-            EbmlElementId::DocType => {
-                let value = EbmlString::new(&size, cursor)?;
-                Element::Header(EbmlHeaderElement::DocType(DocType::new(size, value)))
-            }
-            EbmlElementId::DocTypeVersion => {
-                let value = EbmlUnsignedInteger::new(&size, cursor)?;
-                Element::Header(EbmlHeaderElement::DocTypeVersion(DocTypeVersion::new(
-                    size, value,
-                )))
-            }
-            EbmlElementId::DocTypeReadVersion => {
-                let value = EbmlUnsignedInteger::new(&size, cursor)?;
-                Element::Header(EbmlHeaderElement::DocTypeReadVersion(
-                    DocTypeReadVersion::new(size, value),
-                ))
-            }
-            EbmlElementId::DocTypeExtension => {
-                Element::Header(EbmlHeaderElement::DocTypeExtension(DocTypeExtension::new(
-                    size,
-                    cursor.position() as usize, // Don't advance since it's a master element
-                )))
-            }
-            EbmlElementId::DocTypeExtensionName => {
-                let value = EbmlString::new(&size, cursor)?;
-                Element::Header(EbmlHeaderElement::DocTypeExtensionName(
-                    DocTypeExtensionName::new(size, value),
-                ))
-            }
-            EbmlElementId::DocTypeExtensionVersion => {
-                let value = EbmlUnsignedInteger::new(&size, cursor)?;
-                Element::Header(EbmlHeaderElement::DocTypeExtensionVersion(
-                    DocTypeExtensionVersion::new(size, value),
-                ))
-            }
-            EbmlElementId::Crc32 => {
-                let binary = EbmlBinary::new(&size, cursor)?;
-                Element::Global(EbmlGlobalElement::Crc32(Crc32::new(size, binary)))
-            }
-            EbmlElementId::Void => {
-                cursor.advance(size.value as usize);
-                Element::Global(EbmlGlobalElement::Void(Void::new(size)))
-            }
-            EbmlElementId::Unknown(_) => return Err(EbmlError::UnknownHeaderElement(id, size)),
-        };
-        Ok(header_element)
+            let num_bytes = zeros + 1;
+            let shift = 8 - num_bytes;
+            let masked_value = bytes[0] ^ 1u8 << shift; // Zero the marker bit
+
+            Ok((num_bytes, masked_value, bytes[0]))
+        } else {
+            Err(EbmlError::NoData)
+        }
     }
-}
 
-pub struct Chapter<'a> {
-    data: &'a [u8],
-}
+    #[inline]
+    fn get_var_int_value(
+        cursor: &mut Cursor<&[u8]>,
+        first_byte: u8,
+        num_bytes: usize,
+    ) -> Result<[u8; 8], EbmlError> {
+        let mut bytes: [u8; 8] = [0; 8];
+        let first_index = 8 - num_bytes;
+        bytes[first_index] = first_byte; // Put the first byte at the beginning of the big endian number in the array
 
-/// Example for matroska
-pub enum MatroskaElement<'a> {
-    Chapter(Chapter<'a>),
-    EbmlElement(Element<'a>),
-}
-
-pub struct MatroskaParser {
-    base_parser: BaseEbmlParser,
-}
-
-impl MatroskaParser {
-    pub fn new(base_parser: BaseEbmlParser) -> Self {
-        MatroskaParser { base_parser }
-    }
-}
-
-impl<'a> EbmlParser<'a> for MatroskaParser {
-    type Output = MatroskaElement<'a>;
-
-    fn next(
-        &self,
-        id: u64,
-        size: VarInt,
-        cursor: &mut Cursor<&'a [u8]>,
-    ) -> Result<Self::Output, EbmlError> {
-        // TODO: during WRITING, the size might not be known, and if unknownsizeallowed is true, this is allowed
-        let header_element = match id {
-            // ID_EBML_HEADER => MatroskaElement::Chapter(Chapter {
-            //     data: cursor.get_ref(),
-            // }),
-            _ => {
-                let x = self.base_parser.next(id, size, cursor)?;
-                MatroskaElement::EbmlElement(x)
+        if num_bytes > 1 {
+            // Read the number of bytes indicated by byte 0 into the end of the array (since it's big endian)
+            let expected_read_amount = num_bytes - 1;
+            if cursor.read(&mut bytes[first_index + 1..])? < expected_read_amount {
+                return Err(EbmlError::VarIntEndedEarly);
             }
-        };
-        Ok(header_element)
+        }
+
+        Ok(bytes)
+    }
+
+    #[inline]
+    pub fn all_ones(&self) -> bool {
+        self.value == self.length.maximum_value()
+    }
+
+    /// Check if the varint is the most compact form possible without losing data
+    /// Specifically for ELEMENT ID
+    pub fn is_shortest_valid_element_id_length(&self) -> bool {
+        match self.length {
+            VarIntLength::One => true,
+            VarIntLength::Two => self.value > VarIntLength::One.maximum_value(),
+            VarIntLength::Three => self.value > VarIntLength::Two.maximum_value(),
+            VarIntLength::Four => self.value > VarIntLength::Three.maximum_value(),
+            VarIntLength::Five => self.value > VarIntLength::Four.maximum_value(),
+            VarIntLength::Six => self.value > VarIntLength::Five.maximum_value(),
+            VarIntLength::Seven => self.value > VarIntLength::Six.maximum_value(),
+            VarIntLength::Eight => self.value > VarIntLength::Seven.maximum_value(),
+        }
     }
 }

@@ -1,7 +1,9 @@
-
-pub mod types;
-use std::io::{Cursor, Read};
+#[allow(unused)]
+mod types;
+use std::io::{Cursor, Seek};
 use thiserror::Error;
+
+pub use types::*;
 
 #[derive(Error, Debug)]
 pub enum EbmlError {
@@ -31,136 +33,12 @@ pub enum EbmlError {
     InvalidString,
     #[error("An element/data that must be sized had an unknown size: {0}")]
     MustBeSized(&'static str),
-}
-
-#[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub enum VarIntLength {
-    One,
-    Two,
-    Three,
-    Four,
-    Five,
-    Six,
-    Seven,
-    Eight,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct VarInt {
-    length: VarIntLength,
-    bytes: [u8; 8],
-    value: u64,
-    raw_value: u64, // The value before masking the marker bit
-}
-
-impl VarIntLength {
-    fn new(num_bytes: usize) -> Result<Self, EbmlError> {
-        match num_bytes {
-            1 => Ok(VarIntLength::One),
-            2 => Ok(VarIntLength::Two),
-            3 => Ok(VarIntLength::Three),
-            4 => Ok(VarIntLength::Four),
-            5 => Ok(VarIntLength::Five),
-            6 => Ok(VarIntLength::Six),
-            7 => Ok(VarIntLength::Seven),
-            8 => Ok(VarIntLength::Eight),
-            _ => Err(EbmlError::InvalidVarIntLength),
-        }
-    }
-
-    fn maximum_value(&self) -> u64 {
-        match self {
-            VarIntLength::One => 127,
-            VarIntLength::Two => 16383,
-            VarIntLength::Three => 2097151,
-            VarIntLength::Four => 268435455,
-            VarIntLength::Five => 34359738367,
-            VarIntLength::Six => 4398046511103,
-            VarIntLength::Seven => 562949953421311,
-            VarIntLength::Eight => 72057594037927935,
-        }
-    }
-}
-
-impl VarInt {
-    #[inline]
-    pub fn get_var_int(cursor: &mut Cursor<&[u8]>) -> Result<VarInt, EbmlError> {
-        let (num_bytes, masked_first_byte, first_byte) = Self::get_var_int_length(cursor)?;
-        if num_bytes > 8 || num_bytes == 0 {
-            Err(EbmlError::InvalidVarIntLength)
-        } else {
-            let varint = Self::get_var_int_value(cursor, masked_first_byte, num_bytes)?;
-            let mut raw_value = varint.clone();
-            raw_value[8 - num_bytes] = first_byte;
-            Ok(VarInt {
-                length: VarIntLength::new(num_bytes)?,
-                bytes: varint,
-                raw_value: u64::from_be_bytes(raw_value),
-                value: u64::from_be_bytes(varint),
-            })
-        }
-    }
-
-    /// Get the size of the varint and the value of the first byte with the market bit removed
-    #[inline]
-    fn get_var_int_length(cursor: &mut Cursor<&[u8]>) -> Result<(usize, u8, u8), EbmlError> {
-        let mut bytes: [u8; 1] = [0; 1];
-
-        if cursor.read(&mut bytes[..])? == 1 {
-            let zeros = bytes[0].leading_zeros() as usize;
-            if zeros == 8 {
-                return Err(EbmlError::VarIntNoLength);
-            }
-            let num_bytes = zeros + 1;
-            let shift = 8 - num_bytes;
-            let masked_value = bytes[0] ^ 1u8 << shift; // Zero the marker bit
-
-            Ok((num_bytes, masked_value, bytes[0]))
-        } else {
-            Err(EbmlError::NoData)
-        }
-    }
-
-    #[inline]
-    fn get_var_int_value(
-        cursor: &mut Cursor<&[u8]>,
-        first_byte: u8,
-        num_bytes: usize,
-    ) -> Result<[u8; 8], EbmlError> {
-        let mut bytes: [u8; 8] = [0; 8];
-        let first_index = 8 - num_bytes;
-        bytes[first_index] = first_byte; // Put the first byte at the beginning of the big endian number in the array
-
-        if num_bytes > 1 {
-            // Read the number of bytes indicated by byte 0 into the end of the array (since it's big endian)
-            let expected_read_amount = num_bytes - 1;
-            if cursor.read(&mut bytes[first_index + 1..])? < expected_read_amount {
-                return Err(EbmlError::VarIntEndedEarly);
-            }
-        }
-
-        Ok(bytes)
-    }
-
-    #[inline]
-    pub fn all_ones(&self) -> bool {
-        self.value == self.length.maximum_value()
-    }
-}
-
-/// Check if the varint is the most compact form possible without losing data
-/// Specifically for ELEMENT ID
-fn is_shortest_valid_element_id_length(varint: &VarInt) -> bool {
-    match varint.length {
-        VarIntLength::One => true,
-        VarIntLength::Two => varint.value > VarIntLength::One.maximum_value(),
-        VarIntLength::Three => varint.value > VarIntLength::Two.maximum_value(),
-        VarIntLength::Four => varint.value > VarIntLength::Three.maximum_value(),
-        VarIntLength::Five => varint.value > VarIntLength::Four.maximum_value(),
-        VarIntLength::Six => varint.value > VarIntLength::Five.maximum_value(),
-        VarIntLength::Seven => varint.value > VarIntLength::Six.maximum_value(),
-        VarIntLength::Eight => varint.value > VarIntLength::Seven.maximum_value(),
-    }
+    #[error("Invalid Element: {0}")]
+    InvalidElement(String),
+    #[error("Over maximum size: {0}")]
+    OverMaximumSize(usize),
+    #[error("Couldn't Seek")]
+    CouldntSeek,
 }
 
 #[inline]
@@ -168,8 +46,6 @@ pub fn get_element_id(cursor: &mut Cursor<&[u8]>) -> Result<u64, EbmlError> {
     let varint = VarInt::get_var_int(cursor)?;
     if varint.length > VarIntLength::Four {
         // TODO: Can be configured in the EBMLMaxIDLength header field
-        // BUT this only applies to the body - it's almost like there needs to be a parser for the header separate from the body.
-        // Also, it's a 'guarantee' that the header and body are separated, so why parse them in a single loop?
         return Err(EbmlError::InvalidElementIdSize);
     }
 
@@ -181,7 +57,7 @@ pub fn get_element_id(cursor: &mut Cursor<&[u8]>) -> Result<u64, EbmlError> {
         return Err(EbmlError::ElementIdAllOnes);
     }
 
-    if is_shortest_valid_element_id_length(&varint) {
+    if varint.is_shortest_valid_element_id_length() {
         Ok(varint.raw_value)
     } else {
         Err(EbmlError::ElementIdLongerThanNeeded)
@@ -196,94 +72,30 @@ pub fn get_data_size(cursor: &mut Cursor<&[u8]>) -> Result<VarInt, EbmlError> {
     // if all zeros (aka empty element) and there's a default, default should be returned
     // if all bits are one, the size of the element is unknown
     // spec: Only a Master Element is allowed to be of unknown size, and it can only be so if the unknownsizeallowed attribute of its EBML Schema is set to true
-    //
 }
+
+#[inline]
+pub fn get_data<'a>(size: u64, cursor: &mut Cursor<&'a [u8]>) -> Result<&'a [u8], EbmlError> {
+  let start = cursor.position() as usize;
+  let end = start + size as usize;
+  let data = &cursor.get_ref()[start..end];
+  cursor
+      .seek_relative(data.len() as i64)
+      .map_err(|_| EbmlError::CouldntSeek)?;
+  Ok(data)
+}
+
+
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read};
-
-    use crate::{
-        get_data_size, get_element_id,
-        types::{BaseEbmlParser, EbmlHeaderElement, EbmlIterator, EbmlParser, MatroskaParser},
-        VarInt, VarIntLength,
-    };
-
-    #[test]
-    fn test() {
-        use std::fs::File;
-
-        use memmap2::Mmap;
-
-        let file = File::open("test1.mkv").unwrap();
-
-        let mmap = unsafe { Mmap::map(&file).unwrap() };
-
-        let data = &mmap[..];
-        let mut cursor = Cursor::new(data);
-
-        
-        {
-          let parser = MatroskaParser::new(BaseEbmlParser::new());
-            let iterator = EbmlIterator::new(parser, &mut cursor);
-            for item in iterator {
-                if let Err(e) = item {
-                    println!("{e:#?}");
-                    break;
-                }
-                match item.unwrap() {
-                    crate::types::MatroskaElement::Chapter(chapter) => todo!(),
-                    crate::types::MatroskaElement::EbmlElement(header_element) => {
-                        match header_element {
-                            crate::types::Element::Global(g) => match g {
-                                crate::types::EbmlGlobalElement::Crc32(c) => {
-                                    println!("Crc32: {:#?}", c)
-                                }
-                                crate::types::EbmlGlobalElement::Void(v) => {
-                                    println!("Void: {:#?}", v)
-                                }
-                            },
-                            crate::types::Element::Header(h) => match h {
-                                EbmlHeaderElement::Ebml(_) => println!("head"),
-                                EbmlHeaderElement::DocType(s) => println!("type: {:#?}", s),
-                                EbmlHeaderElement::EbmlVersion(v) => println!("version: {:#?}", v),
-                                EbmlHeaderElement::EbmlReadVersion(r) => {
-                                    println!("read version: {:#?}", r)
-                                }
-                                EbmlHeaderElement::EbmlMaxIdLength(v) => {
-                                    println!("EbmlMaxIdLength: {:#?}", v)
-                                }
-                                EbmlHeaderElement::EbmlMaxSizeLength(v) => {
-                                    println!("EbmlMaxSizeLength: {:#?}", v)
-                                }
-                                EbmlHeaderElement::DocTypeVersion(v) => {
-                                    println!("DocTypeVersion: {:#?}", v)
-                                }
-                                EbmlHeaderElement::DocTypeReadVersion(v) => {
-                                    println!("DocTypeReadVersion: {:#?}", v)
-                                }
-                                EbmlHeaderElement::DocTypeExtension(v) => {
-                                    println!("DocTypeExtension: {:#?}", v)
-                                }
-                                EbmlHeaderElement::DocTypeExtensionName(v) => {
-                                    println!("DocTypeExtensionName: {:#?}", v)
-                                }
-                                EbmlHeaderElement::DocTypeExtensionVersion(v) => {
-                                    println!("DocTypeExtensionVersion: {:#?}", v)
-                                }
-                            },
-                            crate::types::Element::Unknown(id) => println!("Unknown: {id:X}"),
-                        }
-                    }
-                }
-            }
-        }
-    }
+    use crate::VarIntLength;
 
     #[test]
     fn test_length_order() {
         assert!(VarIntLength::One < VarIntLength::Two);
     }
+
     mod varint {
 
         use std::io::Cursor;
